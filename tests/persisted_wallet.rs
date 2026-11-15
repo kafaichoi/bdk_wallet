@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::io;
 use std::path::Path;
+use std::pin::Pin;
 
 use anyhow::Context;
 use assert_matches::assert_matches;
 use bdk_chain::DescriptorId;
 use bdk_chain::{
-    ChainPosition, ConfirmationBlockTime, DescriptorExt, keychain_txout::DEFAULT_LOOKAHEAD,
+    ChainPosition, ConfirmationBlockTime, DescriptorExt, Merge, keychain_txout::DEFAULT_LOOKAHEAD,
 };
 use bdk_wallet::coin_selection::InsufficientFunds;
 use bdk_wallet::descriptor::IntoWalletDescriptor;
@@ -16,7 +19,8 @@ use bdk_wallet::persist_test_utils::{
 };
 use bdk_wallet::test_utils::*;
 use bdk_wallet::{
-    ChangeSet, KeychainKind, LoadError, LoadMismatch, LoadWithPersistError, Wallet, WalletPersister,
+    AsyncWalletPersister, ChangeSet, KeychainKind, LoadError, LoadMismatch, LoadWithPersistError,
+    Wallet, WalletPersister,
 };
 use bitcoin::constants::ChainHash;
 use bitcoin::hashes::Hash;
@@ -31,6 +35,52 @@ mod common;
 use common::*;
 
 const DB_MAGIC: &[u8] = &[0x21, 0x24, 0x48];
+
+// Fail before writing anything, to test the wallet's staging contract rather than backend atomicity.
+#[derive(Default)]
+struct FailingPersister {
+    changeset: ChangeSet,
+    fail_next_write: bool,
+}
+
+impl WalletPersister for FailingPersister {
+    type Error = io::Error;
+
+    fn initialize(persister: &mut Self) -> Result<ChangeSet, Self::Error> {
+        Ok(persister.changeset.clone())
+    }
+
+    fn persist(persister: &mut Self, changeset: &ChangeSet) -> Result<(), Self::Error> {
+        if std::mem::take(&mut persister.fail_next_write) {
+            return Err(io::Error::other("injected persistence failure"));
+        }
+        persister.changeset.merge(changeset.clone());
+        Ok(())
+    }
+}
+
+impl AsyncWalletPersister for FailingPersister {
+    type Error = io::Error;
+
+    fn initialize<'a>(
+        persister: &'a mut Self,
+    ) -> Pin<Box<dyn Future<Output = Result<ChangeSet, Self::Error>> + Send + 'a>>
+    where
+        Self: 'a,
+    {
+        Box::pin(async move { <Self as WalletPersister>::initialize(persister) })
+    }
+
+    fn persist<'a>(
+        persister: &'a mut Self,
+        changeset: &'a ChangeSet,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>
+    where
+        Self: 'a,
+    {
+        Box::pin(async move { <Self as WalletPersister>::persist(persister, changeset) })
+    }
+}
 
 #[test]
 fn wallet_is_persisted() -> anyhow::Result<()> {
@@ -227,6 +277,91 @@ fn wallet_is_persisted() -> anyhow::Result<()> {
     )?;
 
     Ok(())
+}
+
+#[test]
+fn wallet_persist_failure_preserves_staged_changes() {
+    let mut db = FailingPersister::default();
+    let mut wallet = Wallet::create_single(get_test_tr_single_sig_xprv())
+        .network(Network::Testnet)
+        .create_wallet(&mut db)
+        .unwrap();
+    let persisted = db.changeset.clone();
+    let address = wallet.reveal_next_address(KeychainKind::External);
+    let staged = wallet
+        .staged()
+        .expect("address reveal must be staged")
+        .clone();
+
+    db.fail_next_write = true;
+    assert_eq!(
+        wallet.persist(&mut db).unwrap_err().kind(),
+        io::ErrorKind::Other,
+    );
+    assert_eq!(wallet.staged(), Some(&staged));
+    assert_eq!(db.changeset, persisted);
+
+    assert!(wallet.persist(&mut db).unwrap());
+    assert!(wallet.staged().is_none());
+    let mut expected = persisted;
+    expected.merge(staged);
+    assert_eq!(db.changeset, expected);
+    drop(wallet);
+
+    let mut loaded = Wallet::load().load_wallet(&mut db).unwrap().unwrap();
+    assert_eq!(
+        loaded.derivation_index(KeychainKind::External),
+        Some(address.index),
+    );
+    assert_eq!(
+        loaded.reveal_next_address(KeychainKind::External).index,
+        address.index + 1,
+    );
+}
+
+#[tokio::test]
+async fn wallet_persist_async_failure_preserves_staged_changes() {
+    let mut db = FailingPersister::default();
+    let mut wallet = Wallet::create_single(get_test_tr_single_sig_xprv())
+        .network(Network::Testnet)
+        .create_wallet_async(&mut db)
+        .await
+        .unwrap();
+    let persisted = db.changeset.clone();
+    let address = wallet.reveal_next_address(KeychainKind::External);
+    let staged = wallet
+        .staged()
+        .expect("address reveal must be staged")
+        .clone();
+
+    db.fail_next_write = true;
+    assert_eq!(
+        wallet.persist_async(&mut db).await.unwrap_err().kind(),
+        io::ErrorKind::Other,
+    );
+    assert_eq!(wallet.staged(), Some(&staged));
+    assert_eq!(db.changeset, persisted);
+
+    assert!(wallet.persist_async(&mut db).await.unwrap());
+    assert!(wallet.staged().is_none());
+    let mut expected = persisted;
+    expected.merge(staged);
+    assert_eq!(db.changeset, expected);
+    drop(wallet);
+
+    let mut loaded = Wallet::load()
+        .load_wallet_async(&mut db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        loaded.derivation_index(KeychainKind::External),
+        Some(address.index),
+    );
+    assert_eq!(
+        loaded.reveal_next_address(KeychainKind::External).index,
+        address.index + 1,
+    );
 }
 
 #[test]
